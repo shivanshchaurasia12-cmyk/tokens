@@ -1,76 +1,42 @@
-import crypto from 'crypto';
-import { getDb, getUnifiedApiKey } from '../db/index.js';
-import { timingSafeStringEqual } from '../routes/proxy.js';
+import { Router } from 'express';
+import type { NextFunction, Request, Response } from 'express';
+import { getUnifiedApiKey } from '../db/index.js';
+import { ollamaRouter } from './ollama.js';
+import { proxyRouter } from './proxy.js';
+import { responsesRouter } from './responses.js';
+import { validateUrlToken } from '../services/url-tokens.js';
 
-function hashToken(token: string): string {
-  return crypto.createHash('sha256').update(token).digest('hex');
-}
+export const urlTokenRouter = Router({ mergeParams: true });
 
-export interface UrlTokenRow {
-  id: number;
-  label: string;
-  tokenPrefix: string;
-  createdAt: string;
-  lastUsedAt: string | null;
-  revokedAt: string | null;
-}
-
-export function listUrlTokens(): UrlTokenRow[] {
-  const rows = getDb().prepare(`
-    SELECT id, label, token_prefix, created_at, last_used_at, revoked_at
-    FROM url_tokens
-    ORDER BY id DESC
-  `).all() as Array<{
-    id: number;
-    label: string;
-    token_prefix: string;
-    created_at: string;
-    last_used_at: string | null;
-    revoked_at: string | null;
-  }>;
-  return rows.map(row => ({
-    id: row.id,
-    label: row.label,
-    tokenPrefix: row.token_prefix,
-    createdAt: row.created_at,
-    lastUsedAt: row.last_used_at,
-    revokedAt: row.revoked_at,
-  }));
-}
-
-export function mintUrlToken(label: string): UrlTokenRow & { token: string } {
-  const token = `flmurl_${crypto.randomBytes(24).toString('base64url')}`;
-  const prefix = `${token.slice(0, 12)}…`;
-  const result = getDb().prepare(`
-    INSERT INTO url_tokens (token_hash, label, token_prefix)
-    VALUES (?, ?, ?)
-  `).run(hashToken(token), label.trim(), prefix);
-  const row = listUrlTokens().find(entry => entry.id === Number(result.lastInsertRowid))!;
-  return { ...row, token };
-}
-
-export function revokeUrlToken(id: number): boolean {
-  return getDb().prepare(`
-    UPDATE url_tokens SET revoked_at = datetime('now')
-    WHERE id = ? AND revoked_at IS NULL
-  `).run(id).changes > 0;
-}
-
-export function validateUrlToken(token: string): boolean {
-  if (!token || timingSafeStringEqual(token, getUnifiedApiKey())) {
-    if (token) {
-      console.warn('[URL tokens] Rejected a raw unified API key in a tokenized URL');
-    }
-    return false;
+urlTokenRouter.use((req: Request, res: Response, next: NextFunction) => {
+  const token = String(req.params.token ?? '');
+  if (!validateUrlToken(token)) {
+    res.status(401).json({
+      error: {
+        message: 'Invalid or revoked URL token',
+        type: 'authentication_error',
+      },
+    });
+    return;
   }
-  const hash = hashToken(token);
-  const row = getDb().prepare(`
-    SELECT id FROM url_tokens
-    WHERE token_hash = ? AND revoked_at IS NULL
-  `).get(hash) as { id: number } | undefined;
-  if (!row) return false;
-  getDb().prepare(
-    "UPDATE url_tokens SET last_used_at = datetime('now') WHERE id = ?",
-  ).run(row.id);
-  return true;
-}
+  // A URL token buys headerless INFERENCE, not the operator's console. The
+  // injection below makes the request look unified to every downstream
+  // router, so routes that read only for the unified key check THIS flag and
+  // refuse — otherwise a shareable, revocable token handed to a headerless
+  // client reads exactly what the client-profile-key rule in routes/proxy.ts
+  // forbids: the install-wide spend ledger (/v1/usage reports every key's
+  // monthly spend, caps and which account is nearly drained).
+  // Downstream protocol routers retain their normal authentication checks.
+  // Supply the unified key internally only after the separately revocable URL
+  // token was verified; it never appears in the public URL.
+  req.headers.authorization = `Bearer ${getUnifiedApiKey()}`;
+  (req as Request & { urlTokenAuthenticated?: boolean }).urlTokenAuthenticated = true;
+  next();
+});
+
+// OpenAI models/chat and Responses under /v1/t/{token}/...
+urlTokenRouter.use(proxyRouter);
+urlTokenRouter.use(responsesRouter);
+
+// Headerless clients may also use /v1/t/{token}/api/chat and /api/tags.
+urlTokenRouter.use(ollamaRouter);
